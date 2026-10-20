@@ -1,0 +1,366 @@
+// tarn-grpc: gRPC client calls for Tarn over tarn-http2 (h2c, trusted
+// networks). Messages are opaque bytes: encode them with tarn-protobuf or any
+// other codec. A Client owns one HTTP/2 connection and runs one call at a
+// time; status is a value the caller inspects, never an abort.
+import "http2"
+import "io"
+import "net"
+import "string"
+
+pub copy enum ErrorKind {
+    /// HTTP/2 or socket failure; see `transport`.
+    Transport
+    InvalidInput
+    /// The peer violated the gRPC wire protocol.
+    Protocol
+    /// A received message exceeds `message_limit`.
+    TooLarge
+    /// No call is active, or its sending side is closed.
+    NoCall
+}
+pub copy struct Error {
+    pub kind ErrorKind
+    pub transport http2.Error
+}
+fn _error(kind ErrorKind) Error {
+    return Error{kind: kind, transport: http2.Error{kind: http2.ErrorKind.InvalidInput, code: 0, io: io.Error.new(io.ErrorKind.OtherOs)}}
+}
+fn _wrap(error http2.Error) Error { return Error{kind: ErrorKind.Transport, transport: error} }
+pub fn Error.would_block(&self) bool {
+    match self.kind { ErrorKind.Transport => { return self.transport.would_block() }
+        _ => { return false } }
+}
+fn _lift<T>(result Result<T, http2.Error>) Result<T, Error> {
+    match result { Ok(value) => { return Ok(value) }
+        Err(error) => { return Err(_wrap(error)) } }
+}
+
+/// gRPC status codes: 0 OK, 1 CANCELLED, 2 UNKNOWN, 4 DEADLINE_EXCEEDED,
+/// 5 NOT_FOUND, 7 PERMISSION_DENIED, 12 UNIMPLEMENTED, 13 INTERNAL,
+/// 14 UNAVAILABLE, 16 UNAUTHENTICATED (others as in the gRPC specification).
+pub struct Status {
+    pub code u32
+    pub message string
+    /// Trailing metadata other than grpc-status and grpc-message.
+    pub trailers Vec<http2.Header>
+}
+pub fn Status.ok(&self) bool { return self.code == 0 }
+fn _status(code u32, message &string) Status { return Status{code: code, message: message.clone(), trailers: Vec.new()} }
+
+pub enum Incoming {
+    Message(Vec<u8>)
+    /// The call ended. No further messages follow.
+    Finished(Status)
+}
+
+pub struct Options {
+    pub http2 http2.Options
+    /// Bound on one received message (default 4 MiB).
+    pub message_limit usize
+}
+pub fn Options.new() Options { return Options{http2: http2.Options.new(), message_limit: 4194304} }
+
+pub struct Client {
+    connection http2.Connection
+    authority string
+    limit usize
+    input Vec<u8>
+    start usize
+    active bool
+    sending bool
+    headers_seen bool
+}
+
+/// Connects to `host:port` (plaintext HTTP/2). Blocks the current native task.
+pub fn dial(address &string, options &Options) Result<Client, Error> {
+    if options.message_limit == 0 || options.message_limit > 67108864 { return Err(_error(ErrorKind.InvalidInput)) }
+    connection := try _lift(http2.connect(address, &options.http2))
+    return Ok(Client{connection: connection, authority: address.clone(), limit: options.message_limit, input: Vec.new(), start: 0,
+        active: false, sending: false, headers_seen: false})
+}
+
+fn _valid_metadata(header &http2.Header) bool {
+    name := header.name.bytes()
+    if name.len() == 0 || name[0] == 58 { return false }
+    for b in name {
+        lower := b >= 97 && b <= 122
+        digit := b >= 48 && b <= 57
+        if !(lower || digit || b == 45 || b == 95 || b == 46) { return false }
+    }
+    for reserved in [5]string{"content-type", "te", "user-agent", "grpc-timeout", "grpc-encoding"} {
+        if &header.name == &reserved { return false }
+    }
+    for b in header.value.bytes() {
+        if b < 32 || b > 126 { return false }
+    }
+    return true
+}
+/// Starts a call to `/package.Service/Method` with caller metadata (lowercase
+/// ASCII names, printable ASCII values). Send messages, then `close_send`.
+pub fn Client.call(&mut self, method &string, metadata &[]http2.Header) Result<void, Error> {
+    if self.active { return Err(_error(ErrorKind.InvalidInput)) }
+    if !string.starts_with(method, "/") || string.find(&(try _need(string.slice(method, 1, method.len()))), "/").is_none() {
+        return Err(_error(ErrorKind.InvalidInput))
+    }
+    var headers: Vec<http2.Header> = Vec.new()
+    headers.push(http2.Header.new(&":method", &"POST"))
+    headers.push(http2.Header.new(&":scheme", &"http"))
+    headers.push(http2.Header.new(&":path", method))
+    headers.push(http2.Header.new(&":authority", &self.authority))
+    headers.push(http2.Header.new(&"content-type", &"application/grpc"))
+    headers.push(http2.Header.new(&"te", &"trailers"))
+    headers.push(http2.Header.new(&"user-agent", &"grpc-tarn/0.1.0"))
+    for header in metadata {
+        if !_valid_metadata(header) { return Err(_error(ErrorKind.InvalidInput)) }
+        headers.push(header.clone())
+    }
+    try _lift(self.connection.open(headers.as_slice(), false))
+    self.active = true
+    self.sending = true
+    self.headers_seen = false
+    self.input = Vec.new()
+    self.start = 0
+    return Ok(())
+}
+fn _need(value Option<string>) Result<string, Error> {
+    match value { Some(text) => { return Ok(text) }
+        None => { return Err(_error(ErrorKind.InvalidInput)) } }
+}
+/// Sends one length-prefixed, uncompressed message.
+pub fn Client.send(&mut self, message &[]u8) Result<void, Error> {
+    if !self.active || !self.sending { return Err(_error(ErrorKind.NoCall)) }
+    if message.len() > 4294967295 { return Err(_error(ErrorKind.InvalidInput)) }
+    var frame: Vec<u8> = Vec.with_capacity(message.len() + 5)
+    length := u64(message.len())
+    frame.push(0)
+    frame.push(u8(length >> 24))
+    frame.push(u8((length >> 16) & 255))
+    frame.push(u8((length >> 8) & 255))
+    frame.push(u8(length & 255))
+    frame.extend_from_slice(message)
+    return _lift(self.connection.send(frame.as_slice(), false))
+}
+/// Half-closes the call: the server sees the end of the request stream.
+pub fn Client.close_send(&mut self) Result<void, Error> {
+    if !self.active || !self.sending { return Err(_error(ErrorKind.NoCall)) }
+    self.sending = false
+    return _lift(self.connection.send(&[0]u8{}, true))
+}
+/// Cancels the active call (RST_STREAM CANCEL).
+pub fn Client.cancel(&mut self) Result<void, Error> {
+    if !self.active { return Err(_error(ErrorKind.NoCall)) }
+    self.active = false
+    self.sending = false
+    return _lift(self.connection.reset(8))
+}
+pub fn Client.in_call(&self) bool { return self.active }
+/// Encoded HTTP/2 bytes and DATA still waiting to be written.
+pub fn Client.pending(&self) usize { return self.connection.pending() + self.connection.unsent() }
+pub fn Client.flush(&mut self) Result<bool, Error> { return _lift(self.connection.flush()) }
+pub fn Client.stream(&self) &net.TcpStream { return self.connection.stream() }
+pub fn Client.set_nonblocking(&mut self, enabled bool) Result<void, Error> { return _lift(self.connection.set_nonblocking(enabled)) }
+
+// HTTP status mapping from the gRPC HTTP/2 specification.
+fn _http_status(status &string) u32 {
+    if status == &"400" { return 13 }
+    if status == &"401" { return 16 }
+    if status == &"403" { return 7 }
+    if status == &"404" { return 12 }
+    if status == &"429" || status == &"502" || status == &"503" || status == &"504" { return 14 }
+    return 2
+}
+fn _hex(b u8) i32 {
+    if b >= 48 && b <= 57 { return i32(b) - 48 }
+    if b >= 65 && b <= 70 { return i32(b) - 55 }
+    if b >= 97 && b <= 102 { return i32(b) - 87 }
+    return -1
+}
+// grpc-message is percent-encoded UTF-8; malformed escapes stay literal.
+fn _decode_message(value &string) string {
+    bytes := value.bytes()
+    var out: Vec<u8> = Vec.with_capacity(bytes.len())
+    var i = usize(0)
+    for i < bytes.len() {
+        if bytes[i] == 37 && i + 2 < bytes.len() {
+            high := _hex(bytes[i + 1])
+            low := _hex(bytes[i + 2])
+            if high >= 0 && low >= 0 {
+                out.push(u8(high * 16 + low))
+                i = i + 3
+                continue
+            }
+        }
+        out.push(bytes[i])
+        i = i + 1
+    }
+    match string.from_utf8(out.as_slice()) { Some(text) => { return text }
+        None => { return value.clone() } }
+}
+fn _trailers(headers &[]http2.Header) Status {
+    var code = u32(2)
+    var found = false
+    var message = ""
+    var rest: Vec<http2.Header> = Vec.new()
+    for header in headers {
+        if header.name == "grpc-status" {
+            match string.parse_u64(&header.value) {
+                Some(value) => { if value <= 16 { code = u32(value)
+                        found = true } }
+                None => {}
+            }
+        } else if header.name == "grpc-message" {
+            message = _decode_message(&header.value)
+        } else if !string.starts_with(&header.name, ":") {
+            rest.push(header.clone())
+        }
+    }
+    if !found {
+        code = 2
+        if message.is_empty() { message = "missing grpc-status" }
+    }
+    return Status{code: code, message: message, trailers: rest}
+}
+fn _field(headers &[]http2.Header, name &string) string {
+    for header in headers { if &header.name == name { return header.value.clone() } }
+    return ""
+}
+fn Client._finish(&mut self, status Status) Result<Incoming, Error> {
+    self.active = false
+    self.sending = false
+    return Ok(Incoming.Finished(status))
+}
+fn Client._protocol(&mut self) Error {
+    match self.connection.reset(2) { Ok(value) => {}
+        Err(error) => {} }
+    self.active = false
+    self.sending = false
+    return _error(ErrorKind.Protocol)
+}
+/// Next message or the final status. A nonblocking channel returns a
+/// WouldBlock error (`would_block`) when nothing complete is buffered.
+pub fn Client.receive(&mut self) Result<Incoming, Error> {
+    if !self.active { return Err(_error(ErrorKind.NoCall)) }
+    for {
+        available := self.input.len() - self.start
+        if available >= 5 {
+            at := self.start
+            if self.input.at(at) != 0 { return Err(self._protocol()) }
+            length := (usize(self.input.at(at + 1)) << 24) | (usize(self.input.at(at + 2)) << 16) | (usize(self.input.at(at + 3)) << 8) | usize(self.input.at(at + 4))
+            if length > self.limit {
+                match self.connection.reset(8) { Ok(value) => {}
+                    Err(error) => {} }
+                self.active = false
+                self.sending = false
+                return Err(_error(ErrorKind.TooLarge))
+            }
+            if available >= 5 + length {
+                var message: Vec<u8> = Vec.with_capacity(length)
+                message.extend_from_slice(&self.input.as_slice()[at + 5..at + 5 + length])
+                self.start = at + 5 + length
+                if self.start == self.input.len() {
+                    self.input = Vec.new()
+                    self.start = 0
+                }
+                return Ok(Incoming.Message(message))
+            }
+        }
+        match try _lift(self.connection.receive()) {
+            http2.Event.Headers(list, end) => {
+                if !self.headers_seen {
+                    self.headers_seen = true
+                    status := _field(list.as_slice(), &":status")
+                    if status != "200" {
+                        if !end {
+                            match self.connection.reset(8) { Ok(value) => {}
+                                Err(error) => {} }
+                        }
+                        return self._finish(_status(_http_status(&status), &("HTTP status " + &status)))
+                    }
+                    if !string.starts_with(&_field(list.as_slice(), &"content-type"), "application/grpc") { return Err(self._protocol()) }
+                    if !end { continue }
+                }
+                // Trailers (or a trailers-only response). Leftover bytes are a
+                // truncated message.
+                if self.input.len() != self.start { return Err(self._protocol()) }
+                return self._finish(_trailers(list.as_slice()))
+            }
+            http2.Event.Data(bytes, end) => {
+                if !self.headers_seen { return Err(self._protocol()) }
+                if self.start > 0 && self.start * 2 >= self.input.len() {
+                    var rest: Vec<u8> = Vec.with_capacity(self.input.len() - self.start + bytes.len())
+                    rest.extend_from_slice(&self.input.as_slice()[self.start..])
+                    self.input = rest
+                    self.start = 0
+                }
+                self.input.extend_from_slice(bytes.as_slice())
+                if end {
+                    // The stream ended without trailers.
+                    self.active = false
+                    self.sending = false
+                    return Ok(Incoming.Finished(_status(13, &"stream ended without trailers")))
+                }
+            }
+            http2.Event.Reset(code) => {
+                var mapped = u32(13)
+                if code == 8 { mapped = 1 }
+                if code == 7 { mapped = 14 }
+                return self._finish(_status(mapped, &"stream reset by peer"))
+            }
+        }
+    }
+}
+
+/// One request, one response. Returns the response bytes and the status;
+/// a non-OK status carries no message.
+pub fn Client.unary(&mut self, method &string, metadata &[]http2.Header, request &[]u8) Result<Reply, Error> {
+    try self.call(method, metadata)
+    try self.send(request)
+    try self.close_send()
+    var response: Option<Vec<u8>> = None
+    for {
+        match try self.receive() {
+            Incoming.Message(bytes) => {
+                if response.is_some() { return Err(self._protocol()) }
+                response = Some(bytes)
+            }
+            Incoming.Finished(status) => {
+                if status.ok() && response.is_none() { return Err(_error(ErrorKind.Protocol)) }
+                return Ok(Reply{message: response, status: status})
+            }
+        }
+    }
+}
+pub struct Reply {
+    pub message Option<Vec<u8>>
+    pub status Status
+}
+
+fn test_grpc_message_percent_decoding() {
+    if _decode_message(&"no est%C3%A1: 100%25 %E2%9C%93") != "no está: 100% ✓" { panic("decoding") }
+    // Malformed escapes and invalid UTF-8 are kept literally.
+    if _decode_message(&"50%") != "50%" || _decode_message(&"%zz") != "%zz" { panic("malformed escape") }
+    if _decode_message(&"%FF") != "%FF" { panic("invalid UTF-8") }
+}
+fn test_http_status_mapping() {
+    if _http_status(&"401") != 16 || _http_status(&"404") != 12 || _http_status(&"503") != 14 || _http_status(&"500") != 2 { panic("mapping") }
+}
+fn test_trailers() {
+    var list: Vec<http2.Header> = Vec.new()
+    list.push(http2.Header.new(&"grpc-status", &"7"))
+    list.push(http2.Header.new(&"grpc-message", &"denied"))
+    list.push(http2.Header.new(&"x-extra", &"1"))
+    status := _trailers(list.as_slice())
+    if status.code != 7 || status.message != "denied" || status.trailers.len() != 1 { panic("trailers") }
+    missing := _trailers(&[0]http2.Header{})
+    if missing.code != 2 || missing.message != "missing grpc-status" { panic("missing status") }
+    var bad: Vec<http2.Header> = Vec.new()
+    bad.push(http2.Header.new(&"grpc-status", &"99"))
+    if _trailers(bad.as_slice()).code != 2 { panic("out of range status") }
+}
+fn test_metadata_validation() {
+    if !_valid_metadata(&http2.Header.new(&"authorization", &"Bearer x")) { panic("valid") }
+    if _valid_metadata(&http2.Header.new(&"Authorization", &"x")) { panic("uppercase") }
+    if _valid_metadata(&http2.Header.new(&":path", &"x")) { panic("pseudo") }
+    if _valid_metadata(&http2.Header.new(&"te", &"x")) { panic("reserved") }
+    if _valid_metadata(&http2.Header.new(&"x-a", &"a\nb")) { panic("control byte") }
+}

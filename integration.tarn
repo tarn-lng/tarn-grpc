@@ -1,0 +1,182 @@
+// Integration client against tests/grpcserver (real grpc-go). Run with
+// tests/run.sh, which starts the server and passes its address.
+import "http2"
+import "io"
+import "lib"
+import "net"
+import "os"
+import "string"
+
+fn require(value bool, what &string) { if !value { panic(what.clone()) } }
+fn ok<T>(result Result<T, lib.Error>) T {
+    match result { Ok(value) => { return value }
+        Err(error) => {
+            print(error.transport.code)
+            panic("gRPC error")
+        } }
+}
+fn varint(out &mut Vec<u8>, value u64) {
+    var rest = value
+    for rest >= 128 {
+        out.push(u8(rest & 127) | 128)
+        rest = rest >> 7
+    }
+    out.push(u8(rest))
+}
+fn read_varint(data &[]u8, cursor &mut usize) u64 {
+    var result = u64(0)
+    var shift = u64(0)
+    for {
+        byte := data[*cursor]
+        *cursor = *cursor + 1
+        result = result | (u64(byte & 127) << shift)
+        if byte < 128 { return result }
+        shift = shift + 7
+    }
+}
+fn token() [1]http2.Header { return [1]http2.Header{http2.Header.new(&"authorization", &"Bearer fixture")} }
+fn trailer(status &lib.Status, name &string) string {
+    for header in status.trailers.as_slice() { if &header.name == name { return header.value.clone() } }
+    return ""
+}
+
+fn unary(client &mut lib.Client) {
+    // Sum: field 1 repeated varint, field 2 label.
+    var request: Vec<u8> = Vec.new()
+    for value in [3]u64{150, 300, 5000000000} {
+        request.push(8)
+        varint(&mut request, value)
+    }
+    label := "café ✓"
+    request.push(18)
+    varint(&mut request, u64(label.len()))
+    request.extend_from_slice(label.bytes())
+    reply := ok(client.unary(&"/test.v1.Fixture/Sum", &token(), request.as_slice()))
+    require(reply.status.ok(), &"sum status")
+    require(trailer(&reply.status, &"x-checked") == "protowire", &"sum trailer")
+    match reply.message {
+        Some(bytes) => {
+            data := bytes.as_slice()
+            var cursor = usize(0)
+            require(read_varint(data, &mut cursor) == 8, &"field 1 tag")
+            require(read_varint(data, &mut cursor) == 5000000450, &"sum value")
+            require(read_varint(data, &mut cursor) == 18, &"field 2 tag")
+            length := usize(read_varint(data, &mut cursor))
+            match string.from_utf8(&data[cursor..cursor + length]) { Some(text) => { require(text == label, &"label") }
+                None => { panic("label utf8") } }
+            cursor = cursor + length
+            require(read_varint(data, &mut cursor) == 24, &"field 3 tag")
+            require(read_varint(data, &mut cursor) == 10000000899, &"zigzag -sum")
+            require(cursor == data.len(), &"trailing bytes")
+        }
+        None => { panic("sum without message") }
+    }
+}
+fn statuses(client &mut lib.Client) {
+    var empty: Vec<u8> = Vec.new()
+    unauthenticated := ok(client.unary(&"/test.v1.Fixture/Sum", &[0]http2.Header{}, empty.as_slice()))
+    require(unauthenticated.status.code == 16 && unauthenticated.status.message == "missing token", &"unauthenticated")
+    require(unauthenticated.message.is_none(), &"error carries no message")
+    failed := ok(client.unary(&"/test.v1.Fixture/Fail", &[0]http2.Header{}, empty.as_slice()))
+    require(failed.status.code == 5, &"not found code")
+    require(failed.status.message == "no está: 100% ✓", &"percent-decoded message")
+    missing := ok(client.unary(&"/test.v1.Fixture/Missing", &[0]http2.Header{}, empty.as_slice()))
+    require(missing.status.code == 12, &"unimplemented")
+}
+fn message(index usize) Vec<u8> {
+    var out: Vec<u8> = Vec.with_capacity(20000)
+    for out.len() < 20000 { out.push(u8((index + out.len()) % 251)) }
+    return out
+}
+// Bidirectional stream, nonblocking: messages larger than one HTTP/2 frame
+// are sent while echoes arrive.
+fn streaming(client &mut lib.Client) Result<void, io.Error> {
+    ok(client.call(&"/test.v1.Fixture/Echo", &token()))
+    ok(client.set_nonblocking(true))
+    var poll = try net.Poll.new()
+    poll_token := try poll.register_stream(client.stream(), net.Interest.ReadableWritable)
+    var events = [4]net.Event{net.Event.empty(), net.Event.empty(), net.Event.empty(), net.Event.empty()}
+    total := usize(200)
+    var sent = usize(0)
+    var received = usize(0)
+    var closed = false
+    var finished = false
+    for !finished {
+        if sent < total && client.pending() < 262144 {
+            match client.send(message(sent).as_slice()) {
+                Ok(value) => { sent = sent + 1 }
+                Err(error) => { if !error.would_block() { panic("stream send") } }
+            }
+        }
+        if sent == total && !closed {
+            ok(client.close_send())
+            closed = true
+        }
+        var progressed = true
+        for progressed && !finished {
+            match client.receive() {
+                Ok(incoming) => match incoming {
+                    lib.Incoming.Message(bytes) => {
+                        expected := message(received)
+                        require(bytes.len() == expected.len(), &"echo length")
+                        var i = usize(0)
+                        for i < bytes.len() {
+                            require(bytes.get(i) == expected.get(i), &"echo byte")
+                            i = i + 1
+                        }
+                        received = received + 1
+                    }
+                    lib.Incoming.Finished(status) => {
+                        require(status.ok(), &"echo status")
+                        require(trailer(&status, &"x-count") == "200", &"echo count")
+                        finished = true
+                    }
+                }
+                Err(error) => {
+                    if !error.would_block() { panic("stream receive") }
+                    progressed = false
+                }
+            }
+        }
+        if !finished { require(try poll.wait(&mut events, 5000) > usize(0), &"stream stalled") }
+    }
+    require(received == total, &"echo total")
+    try poll.deregister_stream(client.stream(), poll_token)
+    ok(client.set_nonblocking(false))
+    return Ok(())
+}
+// A server message above the limit cancels the call with TooLarge.
+fn oversized(address &string) {
+    var options = lib.Options.new()
+    options.message_limit = 1048576
+    var client = ok(lib.dial(address, &options))
+    ok(client.call(&"/test.v1.Fixture/Echo", &token()))
+    var big: Vec<u8> = Vec.with_capacity(1048577)
+    for big.len() < 1048577 { big.push(7) }
+    ok(client.send(big.as_slice()))
+    ok(client.close_send())
+    for {
+        match client.receive() {
+            Ok(incoming) => { panic("oversized message accepted") }
+            Err(error) => match error.kind {
+                lib.ErrorKind.TooLarge => { return }
+                _ => { panic("oversized error kind") }
+            }
+        }
+    }
+}
+fn main() Result<void, io.Error> {
+    var args: Vec<string> = Vec.new()
+    match os.args() { Ok(value) => { args = value }
+        Err(error) => { panic("arguments") } }
+    require(args.len() == 2, &"usage: integration ADDRESS")
+    var client = ok(lib.dial(args.get(1), &lib.Options.new()))
+    unary(&mut client)
+    statuses(&mut client)
+    try streaming(&mut client)
+    // The same client serves another call after a stream.
+    unary(&mut client)
+    oversized(args.get(1))
+    print("gRPC integration passed")
+    return Ok(())
+}

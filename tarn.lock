@@ -1,0 +1,26 @@
+{
+  "manifest": "cd98c72e826707f19ba44c4f9c1d2844aa60ac49193ef9bbedd53552540bb5cb",
+  "packages": [
+    {
+      "registry": "file:///home/safases/Documentos/proyectos/tarn-registry/site/",
+      "release": {
+        "dependencies": {},
+        "entry": "lib.tarn",
+        "files": {
+          "README.md": "9c7b2858c34768324e4072f993db34451556d57b0142917a63e8edf4186fe07b",
+          "hpack_tables.tarn": "f9b9154a3c3f56f967a7ddba0fed27a3040753f89e0b2b4b46ab240b2b3c31c9",
+          "integration.tarn": "2ccfc45671a1af365b35d094dcf381fdf47cf57c89b74dcf46adf036b24a8612",
+          "lib.tarn": "47ab62121ddefbb44aaeede27bc1066999bf0ae08a0db9d20aa3f5140a368621",
+          "lib_test.tarn": "c59657a2ce96a08e478cee9c1b669fb5be190a3517e91bf2a128748941b3bf48",
+          "tarn.toml": "4085c57ad751fc725e3e01bc455892e2e3410fddff563b7e8d24ea3ac3c8acf7"
+        },
+        "hash": "854b77885d62917f8f3b741ad37445003bb8edbc169a4077c8c2f07a14b57c95",
+        "name": "http2",
+        "published": 1792534688,
+        "schema": 1,
+        "version": "0.1.0"
+      }
+    }
+  ],
+  "schema": 1
+}

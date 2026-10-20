@@ -1,8 +1,8 @@
 {
-  "manifest": "cd98c72e826707f19ba44c4f9c1d2844aa60ac49193ef9bbedd53552540bb5cb",
+  "manifest": "55da8e91a9b7080ef69218040f3faaef9dc1a249ebb5510c91fb8a08134adf36",
   "packages": [
     {
-      "registry": "file:///home/safases/Documentos/proyectos/tarn-registry/site/",
+      "registry": "https://tarn-lng.github.io/registry/",
       "release": {
         "dependencies": {},
         "entry": "lib.tarn",

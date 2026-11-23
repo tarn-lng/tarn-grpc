@@ -6,6 +6,7 @@ import "http2"
 import "io"
 import "net"
 import "string"
+import "testing"
 
 pub copy enum ErrorKind {
     /// HTTP/2 or socket failure; see `transport`.
@@ -31,8 +32,7 @@ pub fn Error.would_block(&self) bool {
         _ => { return false } }
 }
 fn _lift<T>(result Result<T, http2.Error>) Result<T, Error> {
-    match result { Ok(value) => { return Ok(value) }
-        Err(error) => { return Err(_wrap(error)) } }
+    return result.map_err(_wrap)
 }
 
 /// gRPC status codes: 0 OK, 1 CANCELLED, 2 UNKNOWN, 4 DEADLINE_EXCEEDED,
@@ -109,7 +109,7 @@ pub fn Client.call(&mut self, method &string, metadata &[]http2.Header) Result<v
     headers.push(http2.Header.new(&":authority", &self.authority))
     headers.push(http2.Header.new(&"content-type", &"application/grpc"))
     headers.push(http2.Header.new(&"te", &"trailers"))
-    headers.push(http2.Header.new(&"user-agent", &"grpc-tarn/0.1.0"))
+    headers.push(http2.Header.new(&"user-agent", &"grpc-tarn/0.1.1"))
     for header in metadata {
         if !_valid_metadata(header) { return Err(_error(ErrorKind.InvalidInput)) }
         headers.push(header.clone())
@@ -123,8 +123,7 @@ pub fn Client.call(&mut self, method &string, metadata &[]http2.Header) Result<v
     return Ok(())
 }
 fn _need(value Option<string>) Result<string, Error> {
-    match value { Some(text) => { return Ok(text) }
-        None => { return Err(_error(ErrorKind.InvalidInput)) } }
+    return value.ok_or(_error(ErrorKind.InvalidInput))
 }
 /// Sends one length-prefixed, uncompressed message.
 pub fn Client.send(&mut self, message &[]u8) Result<void, Error> {
@@ -335,32 +334,32 @@ pub struct Reply {
     pub status Status
 }
 
-fn test_grpc_message_percent_decoding() {
-    if _decode_message(&"no est%C3%A1: 100%25 %E2%9C%93") != "no está: 100% ✓" { panic("decoding") }
+fn test_grpc_message_percent_decoding(t &mut testing.T) {
+    t.require(!(_decode_message(&"no est%C3%A1: 100%25 %E2%9C%93") != "no está: 100% ✓"), &"decoding")
     // Malformed escapes and invalid UTF-8 are kept literally.
-    if _decode_message(&"50%") != "50%" || _decode_message(&"%zz") != "%zz" { panic("malformed escape") }
-    if _decode_message(&"%FF") != "%FF" { panic("invalid UTF-8") }
+    t.require(!(_decode_message(&"50%") != "50%" || _decode_message(&"%zz") != "%zz"), &"malformed escape")
+    t.require(!(_decode_message(&"%FF") != "%FF"), &"invalid UTF-8")
 }
-fn test_http_status_mapping() {
-    if _http_status(&"401") != 16 || _http_status(&"404") != 12 || _http_status(&"503") != 14 || _http_status(&"500") != 2 { panic("mapping") }
+fn test_http_status_mapping(t &mut testing.T) {
+    t.require(!(_http_status(&"401") != 16 || _http_status(&"404") != 12 || _http_status(&"503") != 14 || _http_status(&"500") != 2), &"mapping")
 }
-fn test_trailers() {
+fn test_trailers(t &mut testing.T) {
     var list: Vec<http2.Header> = Vec.new()
     list.push(http2.Header.new(&"grpc-status", &"7"))
     list.push(http2.Header.new(&"grpc-message", &"denied"))
     list.push(http2.Header.new(&"x-extra", &"1"))
     status := _trailers(list.as_slice())
-    if status.code != 7 || status.message != "denied" || status.trailers.len() != 1 { panic("trailers") }
+    t.require(!(status.code != 7 || status.message != "denied" || status.trailers.len() != 1), &"trailers")
     missing := _trailers(&[0]http2.Header{})
-    if missing.code != 2 || missing.message != "missing grpc-status" { panic("missing status") }
+    t.require(!(missing.code != 2 || missing.message != "missing grpc-status"), &"missing status")
     var bad: Vec<http2.Header> = Vec.new()
     bad.push(http2.Header.new(&"grpc-status", &"99"))
-    if _trailers(bad.as_slice()).code != 2 { panic("out of range status") }
+    t.require(!(_trailers(bad.as_slice()).code != 2), &"out of range status")
 }
-fn test_metadata_validation() {
-    if !_valid_metadata(&http2.Header.new(&"authorization", &"Bearer x")) { panic("valid") }
-    if _valid_metadata(&http2.Header.new(&"Authorization", &"x")) { panic("uppercase") }
-    if _valid_metadata(&http2.Header.new(&":path", &"x")) { panic("pseudo") }
-    if _valid_metadata(&http2.Header.new(&"te", &"x")) { panic("reserved") }
-    if _valid_metadata(&http2.Header.new(&"x-a", &"a\nb")) { panic("control byte") }
+fn test_metadata_validation(t &mut testing.T) {
+    t.require(!(!_valid_metadata(&http2.Header.new(&"authorization", &"Bearer x"))), &"valid")
+    t.require(!(_valid_metadata(&http2.Header.new(&"Authorization", &"x"))), &"uppercase")
+    t.require(!(_valid_metadata(&http2.Header.new(&":path", &"x"))), &"pseudo")
+    t.require(!(_valid_metadata(&http2.Header.new(&"te", &"x"))), &"reserved")
+    t.require(!(_valid_metadata(&http2.Header.new(&"x-a", &"a\nb"))), &"control byte")
 }

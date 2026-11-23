@@ -1,5 +1,5 @@
 dependencies = { http2 = { version = "^0.1.0", registry = "https://tarn-lng.github.io/registry/" } }
 [package]
 name = "grpc"
-version = "0.1.0"
+version = "0.1.1"
 entry = "lib.tarn"

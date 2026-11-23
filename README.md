@@ -1,10 +1,17 @@
 # tarn-grpc
 
+Requires **Tarn 0.2.0 or newer**. Package version 0.1.1 is independent of the
+compiler version. Discover APIs with the installed `tarn syntax` and `tarn stdlib`.
+Run `bash tests/run.sh /path/to/tarn` or `bash tests/run.sh --docker` to use
+the official Tarn 0.2.0 image pinned by digest.
+
+
 gRPC client calls for [Tarn](https://github.com/tarn-lng/tarn) over
 [tarn-http2](https://github.com/tarn-lng/tarn-http2), in pure Tarn.
 
 **Plaintext HTTP/2 only** (grpc-go `grpc.NewServer()` without credentials):
-use it on trusted networks. TLS gRPC needs ALPN, which Tarn does not expose yet.
+use it on trusted networks. TLS gRPC is not implemented by this package; the Tarn TLS stream API does not
+currently expose an HTTP/2 ALPN option.
 Messages are opaque bytes; encode them with
 [tarn-protobuf](https://github.com/tarn-lng/tarn-protobuf).
 
